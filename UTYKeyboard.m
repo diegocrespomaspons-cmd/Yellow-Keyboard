@@ -1,4 +1,9 @@
-// UTYKeyboard.m  (v5: v4 + repetición del press cada frame mientras la tecla está sostenida)
+// UTYKeyboard.m  (v6: v5 + un solo evento por tecla por frame, sincronizado con la cola del runner)
+//
+// v5 encolaba ~2 press por frame (ticker a 60 Hz, juego a 30 fps). El runner solo procesa un
+// evento por tecla por frame y difiere el resto, así que se acumulaba un backlog y la tecla
+// "seguía presionada" después de soltarla. v6 mira la cola del runner y solo encola cuando
+// está vacía (es decir, una vez por frame, justo después de que el runner la drenó).
 //
 // El runner de GameMaker en iOS trata cada evento de tecla como "presionada por un step"
 // (diseñado para el teclado virtual, que nunca manda key-up). Por eso v4 solo avanzaba un
@@ -260,6 +265,10 @@ static const uintptr_t kTextVMAddr        = 0x100000000ULL;
 static const uintptr_t kKeyEventFnAddr    = 0x1001f2658ULL;   // cola de eventos de teclado (tail-call de F_KeyboardKeyPress)
 static const uint32_t  kKeyEventFnInsn0   = 0xa9bc5ff8;       // stp x24, x23, [sp, #-0x40]!
 static const uintptr_t kCheckStrAddr      = 0x1004e51e8ULL;   // "keyboard_key_press"
+static const uintptr_t kQueueTailAddr     = 0x10073f618ULL;   // puntero a la cola del último evento pendiente
+static const uintptr_t kQueueHeadAddr     = 0x10073f620ULL;   // puntero a la cabeza de la cola (0 = vacía)
+static volatile uintptr_t *gQueueTail = NULL;
+static volatile uintptr_t *gQueueHead = NULL;
 
 typedef void (*UTYKeyEventFn)(int type, long key, long keyRaw, int flags); // type 0 = press, 1 = release
 static UTYKeyEventFn gKeyEventFn = NULL;
@@ -275,11 +284,12 @@ static void uty_locateRunner(void) {
         if (!hdr || hdr->magic != MH_MAGIC_64) continue;
         // Buscar __TEXT para calcular el slide real y validar rangos
         const struct load_command *lc = (const struct load_command *)(hdr + 1);
-        uintptr_t textVM = 0, textSize = 0;
+        uintptr_t textVM = 0, textSize = 0, dataVM = 0, dataSize = 0;
         for (uint32_t c = 0; c < hdr->ncmds; c++) {
             if (lc->cmd == LC_SEGMENT_64) {
                 const struct segment_command_64 *seg = (const struct segment_command_64 *)lc;
-                if (strcmp(seg->segname, "__TEXT") == 0) { textVM = seg->vmaddr; textSize = seg->vmsize; break; }
+                if (strcmp(seg->segname, "__TEXT") == 0) { textVM = seg->vmaddr; textSize = seg->vmsize; }
+                if (strcmp(seg->segname, "__DATA") == 0) { dataVM = seg->vmaddr; dataSize = seg->vmsize; }
             }
             lc = (const struct load_command *)((const char *)lc + lc->cmdsize);
         }
@@ -293,8 +303,14 @@ static void uty_locateRunner(void) {
             UTYLog(@"Validación falló: str='%.20s' insn0=%08x (esperado %08x). Binario distinto; no inyecto", chk, insn0, kKeyEventFnInsn0);
             return;
         }
+        if (kQueueHeadAddr < dataVM || kQueueHeadAddr + 8 > dataVM + dataSize || kQueueTailAddr < dataVM) {
+            UTYLog(@"Cola fuera de __DATA (%lx..%lx); no inyecto", (unsigned long)dataVM, (unsigned long)(dataVM + dataSize));
+            return;
+        }
+        gQueueTail = (volatile uintptr_t *)(kQueueTailAddr + slide);
+        gQueueHead = (volatile uintptr_t *)(kQueueHeadAddr + slide);
         gKeyEventFn = (UTYKeyEventFn)(kKeyEventFnAddr + slide);
-        UTYLog(@"Runner localizado (%s), slide=%lx, KeyEventFn=%p", name, (long)slide, gKeyEventFn);
+        UTYLog(@"Runner localizado (%s), slide=%lx, KeyEventFn=%p, cola head=%p", name, (long)slide, gKeyEventFn, gQueueHead);
         return;
     }
     // no marcar done: puede que el runner aún no esté cargado
@@ -336,10 +352,9 @@ static void uty_injectKey(long code, BOOL down) {
     if (gm < 0) return;
     uty_locateRunner();
     if (!gKeyEventFn) { UTYLogOnce(@"Tecla recibida pero KeyEventFn no disponible"); return; }
-    gKeyEventFn(down ? 0 : 1, gm, gm, 0);
-    if (!down) gPendingRelease[code] = 3;   // reforzar el release en los próximos frames
+    if (!down) gPendingRelease[code] = 2;   // el ticker enviará el release (2 frames, por seguridad)
     gInjected++;
-    if (gInjected <= 20) UTYLog(@"  inyectado GM key %ld %@", gm, down ? @"PRESS" : @"RELEASE");
+    if (gInjected <= 20) UTYLog(@"  estado GM key %ld -> %@", gm, down ? @"DOWN" : @"UP");
 }
 
 #pragma mark - Repetición por frame (CADisplayLink)
@@ -348,7 +363,9 @@ static void uty_injectKey(long code, BOOL down) {
 @end
 @implementation UTYTicker
 - (void)tick:(CADisplayLink *)link {
-    if (!gKeyEventFn) return;
+    if (!gKeyEventFn || !gQueueHead || !gQueueTail) return;
+    // Solo encolar cuando el runner ya drenó la cola: así va exactamente un evento por tecla por frame
+    if (*gQueueHead != 0 || *gQueueTail != 0) return;
     for (int code = 0; code < 256; code++) {
         if (gHidDown[code]) {
             long gm = uty_gmKeyForHID(code);
