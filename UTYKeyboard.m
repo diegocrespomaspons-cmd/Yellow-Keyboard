@@ -371,5 +371,3 @@ static void uty_init(void) {
         });
     }
 }
-    });
-}
