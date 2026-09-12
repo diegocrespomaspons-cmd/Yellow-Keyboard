@@ -1,0 +1,39 @@
+# Guardar en el repo como: .github/workflows/build.yml
+name: Build UTYKeyboard tweak
+
+on:
+  workflow_dispatch:
+  push:
+    paths:
+      - "UTYKeyboard.m"
+      - ".github/workflows/build.yml"
+
+jobs:
+  build:
+    runs-on: macos-latest
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Compilar dylib arm64 para iOS
+        run: |
+          xcrun -sdk iphoneos clang \
+            -arch arm64 \
+            -miphoneos-version-min=15.0 \
+            -dynamiclib \
+            -fobjc-arc \
+            -O2 \
+            -framework Foundation \
+            -framework UIKit \
+            -framework GameController \
+            -install_name @rpath/UTYKeyboard.dylib \
+            -o UTYKeyboard.dylib \
+            UTYKeyboard.m
+          codesign -s - UTYKeyboard.dylib
+          file UTYKeyboard.dylib
+          otool -L UTYKeyboard.dylib
+
+      - name: Subir artefacto
+        uses: actions/upload-artifact@v4
+        with:
+          name: UTYKeyboard
+          path: UTYKeyboard.dylib
