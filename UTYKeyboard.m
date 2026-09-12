@@ -1,4 +1,4 @@
-// UTYKeyboard.m  (v2: diagnóstico de lecturas del runner + notificación de conexión)
+// UTYKeyboard.m  (v3: contadores de lecturas por frame)
 // LiveContainer tweak: hace que el teclado físico del iPad se vea como un
 // mando (GCController) para el runner de GameMaker de Undertale Yellow.
 //
@@ -56,6 +56,9 @@ static void UTYLogOnce(NSString *msg) {
     UTYLog(@"%@", msg);
 }
 
+// Contadores de lecturas (diagnóstico v3)
+static NSUInteger gReadsButtonA = 0, gReadsButtonAHigh = 0, gReadsIsPressed = 0, gReadsIsPressedTrue = 0, gReadsAxis = 0, gReadsAxisNonZero = 0;
+
 #pragma mark - Objeto "agujero negro": responde a todo devolviendo nil/0
 
 @interface UTYNilObject : NSObject
@@ -82,8 +85,18 @@ static void UTYLogOnce(NSString *msg) {
 @property (nonatomic, assign) BOOL *flag;
 @end
 @implementation UTYButton
-- (float)value { UTYLogOnce(@"runner lee button.value"); return (self.flag && *self.flag) ? 1.0f : 0.0f; }
-- (BOOL)isPressed { UTYLogOnce(@"runner lee button.isPressed"); return self.flag && *self.flag; }
+- (float)value {
+    UTYLogOnce(@"runner lee button.value");
+    BOOL on = self.flag && *self.flag;
+    if (self.flag == &kA) { gReadsButtonA++; if (on) gReadsButtonAHigh++; }
+    return on ? 1.0f : 0.0f;
+}
+- (BOOL)isPressed {
+    UTYLogOnce(@"runner lee button.isPressed");
+    BOOL on = self.flag && *self.flag;
+    gReadsIsPressed++; if (on) gReadsIsPressedTrue++;
+    return on;
+}
 - (BOOL)pressed { return [self isPressed]; }
 - (BOOL)isTouched { return [self isPressed]; }
 - (BOOL)touched { return [self isPressed]; }
@@ -101,6 +114,7 @@ static void UTYLogOnce(NSString *msg) {
     float v = 0;
     if (self.pos && *self.pos) v += 1.0f;
     if (self.neg && *self.neg) v -= 1.0f;
+    gReadsAxis++; if (v != 0) gReadsAxisNonZero++;
     return v;
 }
 - (BOOL)isAnalog { return NO; }
@@ -233,6 +247,14 @@ static void uty_handleKeyCode(long code, BOOL down, NSString *source) {
     }
     static int logged = 0;
     if (logged < 40) { logged++; UTYLog(@"key %ld %@ (%@)", code, down ? @"DOWN" : @"UP", source); }
+    static int upLogged = 0;
+    if (!down && upLogged < 12) {
+        upLogged++;
+        UTYLog(@"  lecturas acumuladas: buttonA.value=%lu (con 1.0: %lu) | isPressed=%lu (true: %lu) | axis=%lu (≠0: %lu)",
+               (unsigned long)gReadsButtonA, (unsigned long)gReadsButtonAHigh,
+               (unsigned long)gReadsIsPressed, (unsigned long)gReadsIsPressedTrue,
+               (unsigned long)gReadsAxis, (unsigned long)gReadsAxisNonZero);
+    }
 
     switch (code) {
         case UIKeyboardHIDUsageKeyboardUpArrow:    case UIKeyboardHIDUsageKeyboardW: kUp = down; break;
@@ -363,6 +385,15 @@ static void uty_init(void) {
 
     // 3) Avisar al runner que "se conectó" un mando (siempre; el sondeo por sí solo no basta si
     //    el runner solo asigna slots al recibir la notificación)
+    // Resumen periódico de lecturas para ver si el runner lee cada frame o solo una vez
+    for (NSNumber *t in @[@2.0, @6.0, @12.0, @20.0]) {
+        dispatch_after(dispatch_time(DISPATCH_TIME_NOW, (int64_t)(t.doubleValue * NSEC_PER_SEC)), dispatch_get_main_queue(), ^{
+            UTYLog(@"t=%@s: controllers=%lu, buttonA.value=%lu, isPressed=%lu, axis=%lu",
+                   t, (unsigned long)gControllersCalls, (unsigned long)gReadsButtonA,
+                   (unsigned long)gReadsIsPressed, (unsigned long)gReadsAxis);
+        });
+    }
+
     for (NSNumber *delay in @[@3.0, @8.0]) {
         dispatch_after(dispatch_time(DISPATCH_TIME_NOW, (int64_t)(delay.doubleValue * NSEC_PER_SEC)), dispatch_get_main_queue(), ^{
             [[NSNotificationCenter defaultCenter] postNotificationName:GCControllerDidConnectNotification
