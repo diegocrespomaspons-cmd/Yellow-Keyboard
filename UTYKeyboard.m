@@ -1,4 +1,10 @@
-// UTYKeyboard.m  (v3: contadores de lecturas por frame)
+// UTYKeyboard.m  (v4: inyección directa en la cola de eventos de teclado del runner)
+//
+// Estrategia v4: el runner de GameMaker expone keyboard_key_press() a GML; internamente
+// esa función encola un evento en la cola de IO del motor. Llamamos a esa función interna
+// con los códigos de tecla de GameMaker (vk_left=37, ord("Z")=90...), así el juego recibe
+// exactamente lo mismo que en PC cuando se presiona una tecla.
+// El mando falso de v1-v3 queda desactivado (UTY_FAKE_GAMEPAD 0).
 // LiveContainer tweak: hace que el teclado físico del iPad se vea como un
 // mando (GCController) para el runner de GameMaker de Undertale Yellow.
 //
@@ -16,6 +22,11 @@
 #import <GameController/GameController.h>
 #import <objc/runtime.h>
 #import <objc/message.h>
+#import <mach-o/dyld.h>
+#import <mach-o/loader.h>
+#import <string.h>
+
+#define UTY_FAKE_GAMEPAD 0
 
 #pragma mark - Estado de teclas
 
@@ -236,6 +247,93 @@ static NSArray *uty_controllers(id self, SEL _cmd) {
     return [real arrayByAddingObject:[UTYController shared]];
 }
 
+#pragma mark - Runner: función interna de eventos de teclado
+
+// Direcciones estáticas en el binario AlmoraDarkosen_1_2_33 (port UTY 1.2). Se validan en runtime.
+static const uintptr_t kTextVMAddr        = 0x100000000ULL;
+static const uintptr_t kKeyEventFnAddr    = 0x1001f2658ULL;   // cola de eventos de teclado (tail-call de F_KeyboardKeyPress)
+static const uint32_t  kKeyEventFnInsn0   = 0xa9bc5ff8;       // stp x24, x23, [sp, #-0x40]!
+static const uintptr_t kCheckStrAddr      = 0x1004e51e8ULL;   // "keyboard_key_press"
+
+typedef void (*UTYKeyEventFn)(int type, long key, long keyRaw, int flags); // type 0 = press, 1 = release
+static UTYKeyEventFn gKeyEventFn = NULL;
+static BOOL gRunnerLookupDone = NO;
+
+static void uty_locateRunner(void) {
+    if (gRunnerLookupDone) return;
+    uint32_t count = _dyld_image_count();
+    for (uint32_t i = 0; i < count; i++) {
+        const char *name = _dyld_get_image_name(i);
+        if (!name || !strstr(name, "AlmoraDarkosen")) continue;
+        const struct mach_header_64 *hdr = (const struct mach_header_64 *)_dyld_get_image_header(i);
+        if (!hdr || hdr->magic != MH_MAGIC_64) continue;
+        // Buscar __TEXT para calcular el slide real y validar rangos
+        const struct load_command *lc = (const struct load_command *)(hdr + 1);
+        uintptr_t textVM = 0, textSize = 0;
+        for (uint32_t c = 0; c < hdr->ncmds; c++) {
+            if (lc->cmd == LC_SEGMENT_64) {
+                const struct segment_command_64 *seg = (const struct segment_command_64 *)lc;
+                if (strcmp(seg->segname, "__TEXT") == 0) { textVM = seg->vmaddr; textSize = seg->vmsize; break; }
+            }
+            lc = (const struct load_command *)((const char *)lc + lc->cmdsize);
+        }
+        gRunnerLookupDone = YES;
+        if (textVM != kTextVMAddr) { UTYLog(@"Runner encontrado pero __TEXT vmaddr=%lx (esperado %lx); no inyecto", (unsigned long)textVM, (unsigned long)kTextVMAddr); return; }
+        if (kKeyEventFnAddr >= textVM + textSize || kCheckStrAddr >= textVM + textSize) { UTYLog(@"Direcciones fuera de __TEXT; no inyecto"); return; }
+        intptr_t slide = (intptr_t)hdr - (intptr_t)textVM;
+        const char *chk = (const char *)(kCheckStrAddr + slide);
+        uint32_t insn0 = *(const uint32_t *)(kKeyEventFnAddr + slide);
+        if (strncmp(chk, "keyboard_key_press", 18) != 0 || insn0 != kKeyEventFnInsn0) {
+            UTYLog(@"Validación falló: str='%.20s' insn0=%08x (esperado %08x). Binario distinto; no inyecto", chk, insn0, kKeyEventFnInsn0);
+            return;
+        }
+        gKeyEventFn = (UTYKeyEventFn)(kKeyEventFnAddr + slide);
+        UTYLog(@"Runner localizado (%s), slide=%lx, KeyEventFn=%p", name, (long)slide, gKeyEventFn);
+        return;
+    }
+    // no marcar done: puede que el runner aún no esté cargado
+}
+
+// HID usage -> código de tecla GameMaker (vk_*). -1 = sin mapeo
+static long uty_gmKeyForHID(long code) {
+    switch (code) {
+        case UIKeyboardHIDUsageKeyboardUpArrow:    case UIKeyboardHIDUsageKeyboardW: return 38; // vk_up
+        case UIKeyboardHIDUsageKeyboardDownArrow:  case UIKeyboardHIDUsageKeyboardS: return 40; // vk_down
+        case UIKeyboardHIDUsageKeyboardLeftArrow:  case UIKeyboardHIDUsageKeyboardA: return 37; // vk_left
+        case UIKeyboardHIDUsageKeyboardRightArrow: case UIKeyboardHIDUsageKeyboardD: return 39; // vk_right
+        case UIKeyboardHIDUsageKeyboardZ:          return 90; // Z
+        case UIKeyboardHIDUsageKeyboardY:          return 89; // Y (por teclados QWERTZ)
+        case UIKeyboardHIDUsageKeyboardReturnOrEnter:
+        case UIKeyboardHIDUsageKeypadEnter:        return 13; // vk_enter
+        case UIKeyboardHIDUsageKeyboardSpacebar:   return 32; // vk_space
+        case UIKeyboardHIDUsageKeyboardX:          return 88; // X
+        case UIKeyboardHIDUsageKeyboardLeftShift:
+        case UIKeyboardHIDUsageKeyboardRightShift: return 16; // vk_shift
+        case UIKeyboardHIDUsageKeyboardC:          return 67; // C
+        case UIKeyboardHIDUsageKeyboardLeftControl:
+        case UIKeyboardHIDUsageKeyboardRightControl: return 17; // vk_control
+        case UIKeyboardHIDUsageKeyboardF4:         return 115; // vk_f4
+        // Esc no se mapea a propósito: "Hold ESC" cierra el juego
+        default: return -1;
+    }
+}
+
+static BOOL gHidDown[256];
+static NSUInteger gInjected = 0;
+
+static void uty_injectKey(long code, BOOL down) {
+    if (code < 0 || code > 255) return;
+    if (gHidDown[code] == down) return;   // deduplicar (llegan por 3 vías)
+    gHidDown[code] = down;
+    long gm = uty_gmKeyForHID(code);
+    if (gm < 0) return;
+    uty_locateRunner();
+    if (!gKeyEventFn) { UTYLogOnce(@"Tecla recibida pero KeyEventFn no disponible"); return; }
+    gKeyEventFn(down ? 0 : 1, gm, gm, 0);
+    gInjected++;
+    if (gInjected <= 30) UTYLog(@"  inyectado GM key %ld %@", gm, down ? @"PRESS" : @"RELEASE");
+}
+
 #pragma mark - Teclas -> estado
 
 static void uty_handleKeyCode(long code, BOOL down, NSString *source) {
@@ -248,13 +346,15 @@ static void uty_handleKeyCode(long code, BOOL down, NSString *source) {
     static int logged = 0;
     if (logged < 40) { logged++; UTYLog(@"key %ld %@ (%@)", code, down ? @"DOWN" : @"UP", source); }
     static int upLogged = 0;
-    if (!down && upLogged < 12) {
+    if (UTY_FAKE_GAMEPAD && !down && upLogged < 12) {
         upLogged++;
         UTYLog(@"  lecturas acumuladas: buttonA.value=%lu (con 1.0: %lu) | isPressed=%lu (true: %lu) | axis=%lu (≠0: %lu)",
                (unsigned long)gReadsButtonA, (unsigned long)gReadsButtonAHigh,
                (unsigned long)gReadsIsPressed, (unsigned long)gReadsIsPressedTrue,
                (unsigned long)gReadsAxis, (unsigned long)gReadsAxisNonZero);
     }
+
+    uty_injectKey(code, down);
 
     switch (code) {
         case UIKeyboardHIDUsageKeyboardUpArrow:    case UIKeyboardHIDUsageKeyboardW: kUp = down; break;
@@ -358,6 +458,7 @@ __attribute__((constructor))
 static void uty_init(void) {
     UTYLog(@"==== UTYKeyboard cargado (proceso: %@) ====", [NSProcessInfo processInfo].processName);
 
+#if UTY_FAKE_GAMEPAD
     // 1) Mando falso
     Method m = class_getClassMethod([GCController class], @selector(controllers));
     if (m) {
@@ -367,6 +468,9 @@ static void uty_init(void) {
     } else {
         UTYLog(@"ERROR: no se encontró +[GCController controllers]");
     }
+#else
+    UTYLog(@"Mando falso desactivado (v4)");
+#endif
 
     // 2) Captura de teclado (varias vías; setear un BOOL es idempotente, así que no importa si se duplican)
     uty_swizzleInstance([UIApplication class], @selector(sendEvent:), (IMP)uty_sendEvent, (IMP *)&orig_sendEvent);
@@ -385,6 +489,14 @@ static void uty_init(void) {
 
     // 3) Avisar al runner que "se conectó" un mando (siempre; el sondeo por sí solo no basta si
     //    el runner solo asigna slots al recibir la notificación)
+    // Intentar localizar el runner (puede cargar después del tweak): reintentos
+    for (NSNumber *t in @[@0.5, @2.0, @5.0]) {
+        dispatch_after(dispatch_time(DISPATCH_TIME_NOW, (int64_t)(t.doubleValue * NSEC_PER_SEC)), dispatch_get_main_queue(), ^{
+            uty_locateRunner();
+            if (!gRunnerLookupDone) UTYLog(@"t=%@s: runner aún no localizado (%u imágenes cargadas)", t, _dyld_image_count());
+        });
+    }
+#if UTY_FAKE_GAMEPAD
     // Resumen periódico de lecturas para ver si el runner lee cada frame o solo una vez
     for (NSNumber *t in @[@2.0, @6.0, @12.0, @20.0]) {
         dispatch_after(dispatch_time(DISPATCH_TIME_NOW, (int64_t)(t.doubleValue * NSEC_PER_SEC)), dispatch_get_main_queue(), ^{
@@ -401,4 +513,5 @@ static void uty_init(void) {
             UTYLog(@"Notificación GCControllerDidConnect enviada a los %@s (controllers sondeado %lu veces)", delay, (unsigned long)gControllersCalls);
         });
     }
+#endif
 }
