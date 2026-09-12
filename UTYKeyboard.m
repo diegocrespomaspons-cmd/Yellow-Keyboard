@@ -1,4 +1,9 @@
-// UTYKeyboard.m  (v4: inyección directa en la cola de eventos de teclado del runner)
+// UTYKeyboard.m  (v5: v4 + repetición del press cada frame mientras la tecla está sostenida)
+//
+// El runner de GameMaker en iOS trata cada evento de tecla como "presionada por un step"
+// (diseñado para el teclado virtual, que nunca manda key-up). Por eso v4 solo avanzaba un
+// pasito por pulsación. v5 reenvía el press en cada refresco de pantalla mientras la tecla
+// siga sostenida, que es lo mismo que hace el overlay táctil del port.
 //
 // Estrategia v4: el runner de GameMaker expone keyboard_key_press() a GML; internamente
 // esa función encola un evento en la cola de IO del motor. Llamamos a esa función interna
@@ -19,6 +24,7 @@
 
 #import <Foundation/Foundation.h>
 #import <UIKit/UIKit.h>
+#import <QuartzCore/QuartzCore.h>
 #import <GameController/GameController.h>
 #import <objc/runtime.h>
 #import <objc/message.h>
@@ -330,8 +336,47 @@ static void uty_injectKey(long code, BOOL down) {
     uty_locateRunner();
     if (!gKeyEventFn) { UTYLogOnce(@"Tecla recibida pero KeyEventFn no disponible"); return; }
     gKeyEventFn(down ? 0 : 1, gm, gm, 0);
+    if (!down) gPendingRelease[code] = 3;   // reforzar el release en los próximos frames
     gInjected++;
-    if (gInjected <= 30) UTYLog(@"  inyectado GM key %ld %@", gm, down ? @"PRESS" : @"RELEASE");
+    if (gInjected <= 20) UTYLog(@"  inyectado GM key %ld %@", gm, down ? @"PRESS" : @"RELEASE");
+}
+
+#pragma mark - Repetición por frame (CADisplayLink)
+
+static int gPendingRelease[256];   // ticks restantes en los que se reenvía RELEASE tras soltar
+
+@interface UTYTicker : NSObject
+@end
+@implementation UTYTicker
+- (void)tick:(CADisplayLink *)link {
+    if (!gKeyEventFn) return;
+    for (int code = 0; code < 256; code++) {
+        if (gHidDown[code]) {
+            long gm = uty_gmKeyForHID(code);
+            if (gm >= 0) gKeyEventFn(0, gm, gm, 0);
+        } else if (gPendingRelease[code] > 0) {
+            gPendingRelease[code]--;
+            long gm = uty_gmKeyForHID(code);
+            if (gm >= 0) gKeyEventFn(1, gm, gm, 0);
+        }
+    }
+}
+@end
+
+static CADisplayLink *gLink = nil;
+static UTYTicker *gTicker = nil;
+
+static void uty_startTicker(void) {
+    if (gLink) return;
+    gTicker = [UTYTicker new];
+    gLink = [CADisplayLink displayLinkWithTarget:gTicker selector:@selector(tick:)];
+    if (@available(iOS 15.0, *)) {
+        gLink.preferredFrameRateRange = CAFrameRateRangeMake(60, 120, 60);
+    } else {
+        gLink.preferredFramesPerSecond = 60;
+    }
+    [gLink addToRunLoop:[NSRunLoop mainRunLoop] forMode:NSRunLoopCommonModes];
+    UTYLog(@"Ticker de repetición iniciado");
 }
 
 #pragma mark - Teclas -> estado
@@ -489,6 +534,8 @@ static void uty_init(void) {
 
     // 3) Avisar al runner que "se conectó" un mando (siempre; el sondeo por sí solo no basta si
     //    el runner solo asigna slots al recibir la notificación)
+    dispatch_async(dispatch_get_main_queue(), ^{ uty_startTicker(); });
+
     // Intentar localizar el runner (puede cargar después del tweak): reintentos
     for (NSNumber *t in @[@0.5, @2.0, @5.0]) {
         dispatch_after(dispatch_time(DISPATCH_TIME_NOW, (int64_t)(t.doubleValue * NSEC_PER_SEC)), dispatch_get_main_queue(), ^{
