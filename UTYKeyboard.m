@@ -1,4 +1,4 @@
-// UTYKeyboard.m
+// UTYKeyboard.m  (v2: diagnóstico de lecturas del runner + notificación de conexión)
 // LiveContainer tweak: hace que el teclado físico del iPad se vea como un
 // mando (GCController) para el runner de GameMaker de Undertale Yellow.
 //
@@ -48,6 +48,14 @@ static void UTYLog(NSString *fmt, ...) {
     [h closeFile];
 }
 
+static void UTYLogOnce(NSString *msg) {
+    static NSMutableSet *seen;
+    if (!seen) seen = [NSMutableSet new];
+    if ([seen containsObject:msg]) return;
+    [seen addObject:msg];
+    UTYLog(@"%@", msg);
+}
+
 #pragma mark - Objeto "agujero negro": responde a todo devolviendo nil/0
 
 @interface UTYNilObject : NSObject
@@ -60,6 +68,7 @@ static void UTYLog(NSString *fmt, ...) {
     return [NSMethodSignature signatureWithObjCTypes:"@@:"];
 }
 - (void)forwardInvocation:(NSInvocation *)inv {
+    UTYLogOnce([NSString stringWithFormat:@"selector desconocido en %@: %@", NSStringFromClass([self class]), NSStringFromSelector(inv.selector)]);
     id nilObj = nil;
     if (strcmp(inv.methodSignature.methodReturnType, "v") != 0) {
         [inv setReturnValue:&nilObj];
@@ -73,8 +82,8 @@ static void UTYLog(NSString *fmt, ...) {
 @property (nonatomic, assign) BOOL *flag;
 @end
 @implementation UTYButton
-- (float)value { return (self.flag && *self.flag) ? 1.0f : 0.0f; }
-- (BOOL)isPressed { return self.flag && *self.flag; }
+- (float)value { UTYLogOnce(@"runner lee button.value"); return (self.flag && *self.flag) ? 1.0f : 0.0f; }
+- (BOOL)isPressed { UTYLogOnce(@"runner lee button.isPressed"); return self.flag && *self.flag; }
 - (BOOL)pressed { return [self isPressed]; }
 - (BOOL)isTouched { return [self isPressed]; }
 - (BOOL)touched { return [self isPressed]; }
@@ -88,6 +97,7 @@ static void UTYLog(NSString *fmt, ...) {
 @end
 @implementation UTYAxis
 - (float)value {
+    UTYLogOnce(@"runner lee axis.value");
     float v = 0;
     if (self.pos && *self.pos) v += 1.0f;
     if (self.neg && *self.neg) v -= 1.0f;
@@ -142,6 +152,9 @@ static void UTYLog(NSString *fmt, ...) {
 @property (nonatomic, strong) UTYDpad *rightThumbstick;
 @end
 @implementation UTYGamepad
+- (UTYButton *)buttonA { UTYLogOnce(@"runner lee gamepad.buttonA"); return _buttonA; }
+- (UTYDpad *)dpad { UTYLogOnce(@"runner lee gamepad.dpad"); return _dpad; }
+- (UTYDpad *)leftThumbstick { UTYLogOnce(@"runner lee gamepad.leftThumbstick"); return _leftThumbstick; }
 - (instancetype)init {
     if ((self = [super init])) {
         static BOOL never = NO;
@@ -175,14 +188,15 @@ static void UTYLog(NSString *fmt, ...) {
 + (instancetype)shared;
 @end
 @implementation UTYController
+- (void)setPlayerIndex:(NSInteger)idx { UTYLogOnce([NSString stringWithFormat:@"runner asignó playerIndex=%ld", (long)idx]); _playerIndex = idx; }
 + (instancetype)shared {
     static UTYController *s;
     static dispatch_once_t once;
     dispatch_once(&once, ^{ s = [UTYController new]; s.pad = [UTYGamepad new]; s.playerIndex = 0; });
     return s;
 }
-- (id)extendedGamepad { return self.pad; }
-- (id)gamepad { return self.pad; }
+- (id)extendedGamepad { UTYLogOnce(@"runner lee controller.extendedGamepad"); return self.pad; }
+- (id)gamepad { UTYLogOnce(@"runner lee controller.gamepad"); return self.pad; }
 - (id)microGamepad { return nil; }
 - (id)physicalInputProfile { return self.pad; }
 - (NSString *)vendorName { return @"UTY Keyboard"; }
@@ -347,14 +361,15 @@ static void uty_init(void) {
     }
     UTYLog(@"Hooks de teclado instalados");
 
-    // 3) Avisar al runner que "se conectó" un mando, por si escucha la notificación en vez de sondear
-    dispatch_after(dispatch_time(DISPATCH_TIME_NOW, (int64_t)(5.0 * NSEC_PER_SEC)), dispatch_get_main_queue(), ^{
-        if (gControllersCalls == 0) {
+    // 3) Avisar al runner que "se conectó" un mando (siempre; el sondeo por sí solo no basta si
+    //    el runner solo asigna slots al recibir la notificación)
+    for (NSNumber *delay in @[@3.0, @8.0]) {
+        dispatch_after(dispatch_time(DISPATCH_TIME_NOW, (int64_t)(delay.doubleValue * NSEC_PER_SEC)), dispatch_get_main_queue(), ^{
             [[NSNotificationCenter defaultCenter] postNotificationName:GCControllerDidConnectNotification
                                                                 object:[UTYController shared]];
-            UTYLog(@"El runner no sondea controllers; notificación GCControllerDidConnect enviada");
-        } else {
-            UTYLog(@"El runner sondea controllers (%lu veces en 5s), no hace falta notificación", (unsigned long)gControllersCalls);
-        }
+            UTYLog(@"Notificación GCControllerDidConnect enviada a los %@s (controllers sondeado %lu veces)", delay, (unsigned long)gControllersCalls);
+        });
+    }
+}
     });
 }
