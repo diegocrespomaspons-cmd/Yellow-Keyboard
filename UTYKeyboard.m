@@ -325,6 +325,7 @@ static long uty_gmKeyForHID(long code) {
 }
 
 static BOOL gHidDown[256];
+static int gPendingRelease[256];   // ticks restantes en los que se reenvía RELEASE tras soltar
 static NSUInteger gInjected = 0;
 
 static void uty_injectKey(long code, BOOL down) {
@@ -342,8 +343,6 @@ static void uty_injectKey(long code, BOOL down) {
 }
 
 #pragma mark - Repetición por frame (CADisplayLink)
-
-static int gPendingRelease[256];   // ticks restantes en los que se reenvía RELEASE tras soltar
 
 @interface UTYTicker : NSObject
 @end
