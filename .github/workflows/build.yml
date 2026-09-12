@@ -25,6 +25,7 @@ jobs:
             -framework Foundation \
             -framework UIKit \
             -framework GameController \
+            -framework QuartzCore \
             -install_name @rpath/UTYKeyboard.dylib \
             -o UTYKeyboard.dylib \
             UTYKeyboard.m
