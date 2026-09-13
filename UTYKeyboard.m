@@ -1,4 +1,9 @@
-// UTYKeyboard.m  (v7: v6 + estado real del teclado vía GCKeyboard cada frame)
+// UTYKeyboard.m  (v8: GCKeyboard solo puede SOLTAR teclas, nunca presionarlas)
+//
+// En v7 GCKeyboard parecía reportar una tecla como presionada después de soltarla, y al ser
+// fuente de verdad la "re-presionaba" sin fin. En v8 la fuente de verdad para presionar son
+// los eventos de UIKit; GCKeyboard solo se usa como red de seguridad para soltar una tecla que
+// según el hardware ya no está presionada (3 frames seguidos), y se registra qué reporta.
 //
 // v6 dependía de que iOS entregara siempre el evento de "tecla soltada"; con varias teclas a la
 // vez a veces se pierde o llega desordenado y la tecla queda pegada. v7 consulta cada frame el
@@ -349,6 +354,8 @@ static BOOL gHidDown[256];
 static int gPendingRelease[256];   // ticks restantes en los que se reenvía RELEASE tras soltar
 static NSUInteger gInjected = 0;
 
+static NSString *uty_gcStateString(long code);
+
 static void uty_injectKey(long code, BOOL down) {
     if (code < 0 || code > 255) return;
     if (gHidDown[code] == down) return;   // deduplicar (llegan por 3 vías)
@@ -359,7 +366,7 @@ static void uty_injectKey(long code, BOOL down) {
     if (!gKeyEventFn) { UTYLogOnce(@"Tecla recibida pero KeyEventFn no disponible"); return; }
     if (!down) gPendingRelease[code] = 2;   // el ticker enviará el release (2 frames, por seguridad)
     gInjected++;
-    if (gInjected <= 20) UTYLog(@"  estado GM key %ld -> %@", gm, down ? @"DOWN" : @"UP");
+    if (gInjected <= 20) UTYLog(@"  estado GM key %ld -> %@ (%@)", gm, down ? @"DOWN" : @"UP", uty_gcStateString(code));
 }
 
 #pragma mark - Repetición por frame (CADisplayLink)
@@ -373,24 +380,41 @@ static const long kMappedHID[] = {
     UIKeyboardHIDUsageKeyboardF4,
 };
 
-// Reconciliar nuestro estado con el estado físico real del teclado (fuente de verdad)
+static int gGCNotPressedStreak[256];
+
+// GCKeyboard como red de seguridad: si el hardware dice "no presionada" 3 frames seguidos
+// y nosotros la tenemos como presionada, la soltamos. Nunca presionamos a partir de GCKeyboard.
 static void uty_reconcileWithGCKeyboard(void) {
     GCKeyboardInput *kb = nil;
     if (@available(iOS 14.0, *)) kb = GCKeyboard.coalescedKeyboard.keyboardInput;
     if (!kb) { UTYLogOnce(@"GCKeyboard no disponible todavía; usando solo eventos"); return; }
-    UTYLogOnce(@"GCKeyboard disponible: estado físico consultado cada frame");
+    UTYLogOnce(@"GCKeyboard disponible: usado solo para soltar teclas pegadas");
     for (size_t i = 0; i < sizeof(kMappedHID) / sizeof(kMappedHID[0]); i++) {
         long code = kMappedHID[i];
+        if (!gHidDown[code]) { gGCNotPressedStreak[code] = 0; continue; }
         GCControllerButtonInput *b = [kb buttonForKeyCode:(GCKeyCode)code];
         if (!b) continue;
-        BOOL p = b.isPressed;
-        if (gHidDown[code] != p) {
-            gHidDown[code] = p;
-            if (!p) gPendingRelease[code] = 2;
+        if (b.isPressed) { gGCNotPressedStreak[code] = 0; continue; }
+        if (++gGCNotPressedStreak[code] >= 3) {
+            gGCNotPressedStreak[code] = 0;
+            gHidDown[code] = NO;
+            gPendingRelease[code] = 2;
             static int fixes = 0;
-            if (fixes < 20) { fixes++; UTYLog(@"  corregido por GCKeyboard: HID %ld -> %@", code, p ? @"DOWN" : @"UP"); }
+            if (fixes < 20) { fixes++; UTYLog(@"  tecla pegada liberada por GCKeyboard: HID %ld", code); }
         }
     }
+}
+
+// Diagnóstico: qué dice GCKeyboard en el momento de cada evento UIKit
+static NSString *uty_gcStateString(long code) {
+    if (@available(iOS 14.0, *)) {
+        GCKeyboardInput *kb = GCKeyboard.coalescedKeyboard.keyboardInput;
+        if (!kb) return @"GC=nil";
+        GCControllerButtonInput *b = [kb buttonForKeyCode:(GCKeyCode)code];
+        if (!b) return @"GC=sinBoton";
+        return b.isPressed ? @"GC=pressed" : @"GC=released";
+    }
+    return @"GC=n/a";
 }
 
 @interface UTYTicker : NSObject
