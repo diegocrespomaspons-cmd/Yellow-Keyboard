@@ -1,4 +1,9 @@
-// UTYKeyboard.m  (v6: v5 + un solo evento por tecla por frame, sincronizado con la cola del runner)
+// UTYKeyboard.m  (v7: v6 + estado real del teclado vía GCKeyboard cada frame)
+//
+// v6 dependía de que iOS entregara siempre el evento de "tecla soltada"; con varias teclas a la
+// vez a veces se pierde o llega desordenado y la tecla queda pegada. v7 consulta cada frame el
+// estado físico real del teclado (GCKeyboard.coalescedKeyboard) y corrige cualquier discrepancia,
+// así una tecla pegada se libera sola al siguiente frame. Los eventos quedan como respaldo.
 //
 // v5 encolaba ~2 press por frame (ticker a 60 Hz, juego a 30 fps). El runner solo procesa un
 // evento por tecla por frame y difiere el resto, así que se acumulaba un backlog y la tecla
@@ -362,8 +367,38 @@ static void uty_injectKey(long code, BOOL down) {
 @interface UTYTicker : NSObject
 @end
 @implementation UTYTicker
+static const long kMappedHID[] = {
+    UIKeyboardHIDUsageKeyboardUpArrow, UIKeyboardHIDUsageKeyboardDownArrow, UIKeyboardHIDUsageKeyboardLeftArrow, UIKeyboardHIDUsageKeyboardRightArrow,
+    UIKeyboardHIDUsageKeyboardW, UIKeyboardHIDUsageKeyboardA, UIKeyboardHIDUsageKeyboardS, UIKeyboardHIDUsageKeyboardD,
+    UIKeyboardHIDUsageKeyboardZ, UIKeyboardHIDUsageKeyboardY, UIKeyboardHIDUsageKeyboardReturnOrEnter, UIKeyboardHIDUsageKeypadEnter, UIKeyboardHIDUsageKeyboardSpacebar,
+    UIKeyboardHIDUsageKeyboardX, UIKeyboardHIDUsageKeyboardLeftShift, UIKeyboardHIDUsageKeyboardRightShift,
+    UIKeyboardHIDUsageKeyboardC, UIKeyboardHIDUsageKeyboardLeftControl, UIKeyboardHIDUsageKeyboardRightControl,
+    UIKeyboardHIDUsageKeyboardF4,
+};
+
+// Reconciliar nuestro estado con el estado físico real del teclado (fuente de verdad)
+static void uty_reconcileWithGCKeyboard(void) {
+    GCKeyboardInput *kb = nil;
+    if (@available(iOS 14.0, *)) kb = GCKeyboard.coalescedKeyboard.keyboardInput;
+    if (!kb) { UTYLogOnce(@"GCKeyboard no disponible todavía; usando solo eventos"); return; }
+    UTYLogOnce(@"GCKeyboard disponible: estado físico consultado cada frame");
+    for (size_t i = 0; i < sizeof(kMappedHID) / sizeof(kMappedHID[0]); i++) {
+        long code = kMappedHID[i];
+        GCControllerButtonInput *b = [kb buttonForKeyCode:(GCKeyCode)code];
+        if (!b) continue;
+        BOOL p = b.isPressed;
+        if (gHidDown[code] != p) {
+            gHidDown[code] = p;
+            if (!p) gPendingRelease[code] = 2;
+            static int fixes = 0;
+            if (fixes < 20) { fixes++; UTYLog(@"  corregido por GCKeyboard: HID %ld -> %@", code, p ? @"DOWN" : @"UP"); }
+        }
+    }
+}
+
 - (void)tick:(CADisplayLink *)link {
     if (!gKeyEventFn || !gQueueHead || !gQueueTail) return;
+    uty_reconcileWithGCKeyboard();
     // Solo encolar cuando el runner ya drenó la cola: así va exactamente un evento por tecla por frame
     if (*gQueueHead != 0 || *gQueueTail != 0) return;
     for (int code = 0; code < 256; code++) {
@@ -538,15 +573,9 @@ static void uty_init(void) {
     uty_swizzleInstance([UIWindow class], @selector(pressesBegan:withEvent:),     (IMP)uty_winBegan,  (IMP *)&orig_winBegan);
     uty_swizzleInstance([UIWindow class], @selector(pressesEnded:withEvent:),     (IMP)uty_winEnded,  (IMP *)&orig_winEnded);
     uty_swizzleInstance([UIWindow class], @selector(pressesCancelled:withEvent:), (IMP)uty_winCancel, (IMP *)&orig_winCancel);
-    uty_swizzleInstance([UIApplication class], @selector(pressesBegan:withEvent:),     (IMP)uty_appBegan,  (IMP *)&orig_appBegan);
-    uty_swizzleInstance([UIApplication class], @selector(pressesEnded:withEvent:),     (IMP)uty_appEnded,  (IMP *)&orig_appEnded);
-    uty_swizzleInstance([UIApplication class], @selector(pressesCancelled:withEvent:), (IMP)uty_appCancel, (IMP *)&orig_appCancel);
-
-    SEL hk = NSSelectorFromString(@"handleKeyUIEvent:");
-    if (class_getInstanceMethod([UIApplication class], hk)) {
-        uty_swizzleInstance([UIApplication class], hk, (IMP)uty_handleKeyUIEvent, (IMP *)&orig_handleKeyUIEvent);
-    }
-    UTYLog(@"Hooks de teclado instalados");
+    // (v7) Las vías UIApplication.presses* y handleKeyUIEvent se desactivan: eran redundantes
+    // con UIWindow.presses* y podían entregar eventos desordenados con varias teclas a la vez.
+    UTYLog(@"Hooks de teclado instalados (UIWindow.presses* + sendEvent)");
 
     // 3) Avisar al runner que "se conectó" un mando (siempre; el sondeo por sí solo no basta si
     //    el runner solo asigna slots al recibir la notificación)
