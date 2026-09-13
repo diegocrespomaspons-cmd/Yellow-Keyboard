@@ -1,4 +1,4 @@
-// UTYKeyboard.m  (v8: GCKeyboard solo puede SOLTAR teclas, nunca presionarlas)
+// UTYKeyboard.m  (v9: v8 + release sostenido 10 frames + telemetría del estado interno del runner)
 //
 // En v7 GCKeyboard parecía reportar una tecla como presionada después de soltarla, y al ser
 // fuente de verdad la "re-presionaba" sin fin. En v8 la fuente de verdad para presionar son
@@ -277,6 +277,8 @@ static const uint32_t  kKeyEventFnInsn0   = 0xa9bc5ff8;       // stp x24, x23, [
 static const uintptr_t kCheckStrAddr      = 0x1004e51e8ULL;   // "keyboard_key_press"
 static const uintptr_t kQueueTailAddr     = 0x10073f618ULL;   // puntero a la cola del último evento pendiente
 static const uintptr_t kQueueHeadAddr     = 0x10073f620ULL;   // puntero a la cabeza de la cola (0 = vacía)
+static const uintptr_t kKeyStateAddr      = 0x100760514ULL;   // byte[256]: estado de tecla que mantiene el runner (1 = down)
+static volatile uint8_t *gRunnerKeyState = NULL;
 static volatile uintptr_t *gQueueTail = NULL;
 static volatile uintptr_t *gQueueHead = NULL;
 
@@ -317,6 +319,7 @@ static void uty_locateRunner(void) {
             UTYLog(@"Cola fuera de __DATA (%lx..%lx); no inyecto", (unsigned long)dataVM, (unsigned long)(dataVM + dataSize));
             return;
         }
+        gRunnerKeyState = (volatile uint8_t *)(kKeyStateAddr + slide);
         gQueueTail = (volatile uintptr_t *)(kQueueTailAddr + slide);
         gQueueHead = (volatile uintptr_t *)(kQueueHeadAddr + slide);
         gKeyEventFn = (UTYKeyEventFn)(kKeyEventFnAddr + slide);
@@ -364,7 +367,7 @@ static void uty_injectKey(long code, BOOL down) {
     if (gm < 0) return;
     uty_locateRunner();
     if (!gKeyEventFn) { UTYLogOnce(@"Tecla recibida pero KeyEventFn no disponible"); return; }
-    if (!down) gPendingRelease[code] = 2;   // el ticker enviará el release (2 frames, por seguridad)
+    if (!down) gPendingRelease[code] = 10;  // el ticker reenviará el release durante 10 frames
     gInjected++;
     if (gInjected <= 20) UTYLog(@"  estado GM key %ld -> %@ (%@)", gm, down ? @"DOWN" : @"UP", uty_gcStateString(code));
 }
@@ -398,7 +401,7 @@ static void uty_reconcileWithGCKeyboard(void) {
         if (++gGCNotPressedStreak[code] >= 3) {
             gGCNotPressedStreak[code] = 0;
             gHidDown[code] = NO;
-            gPendingRelease[code] = 2;
+            gPendingRelease[code] = 10;
             static int fixes = 0;
             if (fixes < 20) { fixes++; UTYLog(@"  tecla pegada liberada por GCKeyboard: HID %ld", code); }
         }
@@ -420,19 +423,32 @@ static NSString *uty_gcStateString(long code) {
 @interface UTYTicker : NSObject
 @end
 @implementation UTYTicker
+static NSUInteger gTicks = 0, gSentPress = 0, gSentRelease = 0;
+
 - (void)tick:(CADisplayLink *)link {
     if (!gKeyEventFn || !gQueueHead || !gQueueTail) return;
     uty_reconcileWithGCKeyboard();
+    gTicks++;
+    if (gTicks % 30 == 0 && gTicks <= 30 * 240 && gRunnerKeyState) {
+        // vk_up=38 vk_down=40 vk_left=37 vk_right=39 ; nuestro estado por HID (82/81/80/79 flechas, 26=W)
+        UTYLog(@"tick %lu | runner KeyDown up=%d down=%d left=%d right=%d Z=%d | nuestro up=%d down=%d left=%d right=%d W=%d | pend up=%d W=%d | cola head=%lx tail=%lx | enviados press=%lu rel=%lu",
+               (unsigned long)gTicks,
+               gRunnerKeyState[38], gRunnerKeyState[40], gRunnerKeyState[37], gRunnerKeyState[39], gRunnerKeyState[90],
+               gHidDown[82], gHidDown[81], gHidDown[80], gHidDown[79], gHidDown[26],
+               gPendingRelease[82], gPendingRelease[26],
+               (unsigned long)*gQueueHead, (unsigned long)*gQueueTail,
+               (unsigned long)gSentPress, (unsigned long)gSentRelease);
+    }
     // Solo encolar cuando el runner ya drenó la cola: así va exactamente un evento por tecla por frame
     if (*gQueueHead != 0 || *gQueueTail != 0) return;
     for (int code = 0; code < 256; code++) {
         if (gHidDown[code]) {
             long gm = uty_gmKeyForHID(code);
-            if (gm >= 0) gKeyEventFn(0, gm, gm, 0);
+            if (gm >= 0) { gKeyEventFn(0, gm, gm, 0); gSentPress++; }
         } else if (gPendingRelease[code] > 0) {
             gPendingRelease[code]--;
             long gm = uty_gmKeyForHID(code);
-            if (gm >= 0) gKeyEventFn(1, gm, gm, 0);
+            if (gm >= 0) { gKeyEventFn(1, gm, gm, 0); gSentRelease++; }
         }
     }
 }
