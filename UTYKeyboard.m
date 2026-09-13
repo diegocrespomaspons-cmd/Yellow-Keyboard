@@ -1,4 +1,14 @@
-// UTYKeyboard.m  (v9: v8 + release sostenido 10 frames + telemetría del estado interno del runner)
+// UTYKeyboard.m  (v11: neutraliza el UIKeyInput del runner)
+//
+// Hallazgo: las flechas funcionan y las letras se pegan porque iOS, además de los eventos de
+// tecla, entrega las LETRAS como texto (insertText:) a la vista del runner, que adopta UIKeyInput
+// para el teclado virtual. El runner convierte ese texto en un "press" fantasma (que además cae
+// en vk_up por un default de su tabla) y nunca llega el release. Las flechas no generan texto,
+// por eso nunca se pegaban. v11 desactiva insertText:/deleteBackward: en las clases del runner.
+//
+// Del desensamblado: keyboard_check(k) lee PrevDown[k] (0x10075de54); keyboard_check_pressed lee
+// Pressed[k] (0x10075e054); keyboard_check_released lee Released[k] (0x10075df54). Down (0x514)
+// se pone a cero al final de cada update, así que era la tabla equivocada para observar.
 //
 // En v7 GCKeyboard parecía reportar una tecla como presionada después de soltarla, y al ser
 // fuente de verdad la "re-presionaba" sin fin. En v8 la fuente de verdad para presionar son
@@ -277,8 +287,11 @@ static const uint32_t  kKeyEventFnInsn0   = 0xa9bc5ff8;       // stp x24, x23, [
 static const uintptr_t kCheckStrAddr      = 0x1004e51e8ULL;   // "keyboard_key_press"
 static const uintptr_t kQueueTailAddr     = 0x10073f618ULL;   // puntero a la cola del último evento pendiente
 static const uintptr_t kQueueHeadAddr     = 0x10073f620ULL;   // puntero a la cabeza de la cola (0 = vacía)
-static const uintptr_t kKeyStateAddr      = 0x100760514ULL;   // byte[256]: estado de tecla que mantiene el runner (1 = down)
-static volatile uint8_t *gRunnerKeyState = NULL;
+static const uintptr_t kKeyStateAddr      = 0x100760514ULL;   // byte[256] Down (acumulador por frame, se limpia al final del update)
+static const uintptr_t kPrevDownAddr      = 0x10075de54ULL;   // byte[256] PrevDown: lo que lee keyboard_check
+static const uintptr_t kPressedAddr       = 0x10075e054ULL;   // byte[256] Pressed: lo que lee keyboard_check_pressed
+static const uintptr_t kReleasedAddr      = 0x10075df54ULL;   // byte[256] Released: lo que lee keyboard_check_released
+static volatile uint8_t *gRunnerKeyState = NULL, *gPrevDown = NULL, *gPressed = NULL, *gReleased = NULL;
 static volatile uintptr_t *gQueueTail = NULL;
 static volatile uintptr_t *gQueueHead = NULL;
 
@@ -320,6 +333,9 @@ static void uty_locateRunner(void) {
             return;
         }
         gRunnerKeyState = (volatile uint8_t *)(kKeyStateAddr + slide);
+        gPrevDown = (volatile uint8_t *)(kPrevDownAddr + slide);
+        gPressed  = (volatile uint8_t *)(kPressedAddr + slide);
+        gReleased = (volatile uint8_t *)(kReleasedAddr + slide);
         gQueueTail = (volatile uintptr_t *)(kQueueTailAddr + slide);
         gQueueHead = (volatile uintptr_t *)(kQueueHeadAddr + slide);
         gKeyEventFn = (UTYKeyEventFn)(kKeyEventFnAddr + slide);
@@ -354,6 +370,7 @@ static long uty_gmKeyForHID(long code) {
 }
 
 static BOOL gHidDown[256];
+static BOOL gEverPressed[256];
 static int gPendingRelease[256];   // ticks restantes en los que se reenvía RELEASE tras soltar
 static NSUInteger gInjected = 0;
 
@@ -363,6 +380,7 @@ static void uty_injectKey(long code, BOOL down) {
     if (code < 0 || code > 255) return;
     if (gHidDown[code] == down) return;   // deduplicar (llegan por 3 vías)
     gHidDown[code] = down;
+    if (down) gEverPressed[code] = YES;
     long gm = uty_gmKeyForHID(code);
     if (gm < 0) return;
     uty_locateRunner();
@@ -423,19 +441,19 @@ static NSString *uty_gcStateString(long code) {
 @interface UTYTicker : NSObject
 @end
 @implementation UTYTicker
-static NSUInteger gTicks = 0, gSentPress = 0, gSentRelease = 0;
+static NSUInteger gTicks = 0, gSentPress = 0, gSentRelease = 0, gStuckFixes = 0;
 
 - (void)tick:(CADisplayLink *)link {
     if (!gKeyEventFn || !gQueueHead || !gQueueTail) return;
     uty_reconcileWithGCKeyboard();
     gTicks++;
-    if (gTicks % 30 == 0 && gTicks <= 30 * 240 && gRunnerKeyState) {
-        // vk_up=38 vk_down=40 vk_left=37 vk_right=39 ; nuestro estado por HID (82/81/80/79 flechas, 26=W)
-        UTYLog(@"tick %lu | runner KeyDown up=%d down=%d left=%d right=%d Z=%d | nuestro up=%d down=%d left=%d right=%d W=%d | pend up=%d W=%d | cola head=%lx tail=%lx | enviados press=%lu rel=%lu",
+    if (gTicks % 30 == 0 && gTicks <= 30 * 240 && gPrevDown) {
+        UTYLog(@"tick %lu | PrevDown up=%d dn=%d l=%d r=%d | Pressed up=%d dn=%d l=%d r=%d | Released up=%d dn=%d l=%d r=%d | nuestro up=%d dn=%d l=%d r=%d W=%d | cola %lx/%lx | enviados press=%lu rel=%lu",
                (unsigned long)gTicks,
-               gRunnerKeyState[38], gRunnerKeyState[40], gRunnerKeyState[37], gRunnerKeyState[39], gRunnerKeyState[90],
+               gPrevDown[38], gPrevDown[40], gPrevDown[37], gPrevDown[39],
+               gPressed[38], gPressed[40], gPressed[37], gPressed[39],
+               gReleased[38], gReleased[40], gReleased[37], gReleased[39],
                gHidDown[82], gHidDown[81], gHidDown[80], gHidDown[79], gHidDown[26],
-               gPendingRelease[82], gPendingRelease[26],
                (unsigned long)*gQueueHead, (unsigned long)*gQueueTail,
                (unsigned long)gSentPress, (unsigned long)gSentRelease);
     }
@@ -449,6 +467,14 @@ static NSUInteger gTicks = 0, gSentPress = 0, gSentRelease = 0;
             gPendingRelease[code]--;
             long gm = uty_gmKeyForHID(code);
             if (gm >= 0) { gKeyEventFn(1, gm, gm, 0); gSentRelease++; }
+        } else if (gEverPressed[code] && gPrevDown) {
+            // Red de seguridad: si el runner sigue creyendo que la tecla está presionada
+            // aunque nosotros ya la soltamos, insistimos con el release y lo registramos.
+            long gm = uty_gmKeyForHID(code);
+            if (gm >= 0 && gPrevDown[gm]) {
+                gKeyEventFn(1, gm, gm, 0); gSentRelease++; gStuckFixes++;
+                if (gStuckFixes <= 20) UTYLog(@"  runner mantenía GM key %ld presionada sin nuestros presses; release extra (#%lu)", gm, (unsigned long)gStuckFixes);
+            }
         }
     }
 }
@@ -588,6 +614,40 @@ static void uty_handleKeyUIEvent(id self, SEL _cmd, id event) {
     if (orig_handleKeyUIEvent) orig_handleKeyUIEvent(self, _cmd, event);
 }
 
+#pragma mark - Neutralizar UIKeyInput del runner
+
+static void uty_noopInsertText(id self, SEL _cmd, id text) { UTYLogOnce(@"insertText: del runner bloqueado"); }
+static void uty_noopDeleteBackward(id self, SEL _cmd) { UTYLogOnce(@"deleteBackward del runner bloqueado"); }
+
+static void uty_disableRunnerTextInput(void) {
+    static BOOL done = NO;
+    if (done) return;
+    unsigned int count = 0;
+    Class *classes = objc_copyClassList(&count);
+    int patched = 0;
+    for (unsigned int i = 0; i < count; i++) {
+        Class cls = classes[i];
+        const char *img = class_getImageName(cls);
+        if (!img || !strstr(img, "AlmoraDarkosen")) continue;
+        unsigned int mcount = 0;
+        Method *methods = class_copyMethodList(cls, &mcount);
+        for (unsigned int m = 0; m < mcount; m++) {
+            SEL sel = method_getName(methods[m]);
+            if (sel == @selector(insertText:)) {
+                method_setImplementation(methods[m], (IMP)uty_noopInsertText);
+                UTYLog(@"Parcheado -[%s insertText:]", class_getName(cls)); patched++;
+            } else if (sel == @selector(deleteBackward)) {
+                method_setImplementation(methods[m], (IMP)uty_noopDeleteBackward);
+                UTYLog(@"Parcheado -[%s deleteBackward]", class_getName(cls)); patched++;
+            }
+        }
+        free(methods);
+    }
+    free(classes);
+    if (patched) done = YES;
+    else UTYLog(@"UIKeyInput del runner aún no encontrado (imagen no cargada todavía?)");
+}
+
 #pragma mark - Instalación
 
 __attribute__((constructor))
@@ -625,6 +685,7 @@ static void uty_init(void) {
     for (NSNumber *t in @[@0.5, @2.0, @5.0]) {
         dispatch_after(dispatch_time(DISPATCH_TIME_NOW, (int64_t)(t.doubleValue * NSEC_PER_SEC)), dispatch_get_main_queue(), ^{
             uty_locateRunner();
+            uty_disableRunnerTextInput();
             if (!gRunnerLookupDone) UTYLog(@"t=%@s: runner aún no localizado (%u imágenes cargadas)", t, _dyld_image_count());
         });
     }
