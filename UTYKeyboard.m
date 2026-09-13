@@ -364,9 +364,6 @@ static void uty_injectKey(long code, BOOL down) {
 
 #pragma mark - Repetición por frame (CADisplayLink)
 
-@interface UTYTicker : NSObject
-@end
-@implementation UTYTicker
 static const long kMappedHID[] = {
     UIKeyboardHIDUsageKeyboardUpArrow, UIKeyboardHIDUsageKeyboardDownArrow, UIKeyboardHIDUsageKeyboardLeftArrow, UIKeyboardHIDUsageKeyboardRightArrow,
     UIKeyboardHIDUsageKeyboardW, UIKeyboardHIDUsageKeyboardA, UIKeyboardHIDUsageKeyboardS, UIKeyboardHIDUsageKeyboardD,
@@ -396,6 +393,9 @@ static void uty_reconcileWithGCKeyboard(void) {
     }
 }
 
+@interface UTYTicker : NSObject
+@end
+@implementation UTYTicker
 - (void)tick:(CADisplayLink *)link {
     if (!gKeyEventFn || !gQueueHead || !gQueueTail) return;
     uty_reconcileWithGCKeyboard();
